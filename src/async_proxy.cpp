@@ -1,204 +1,236 @@
+// HTTP/1.1 reverse proxy: one coroutine per client connection, each with its
+// own keep-alive connection to a single upstream.
+
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
+
 using boost::asio::ip::tcp;
 namespace beast = boost::beast;
+namespace http = beast::http;
 
-static const std::string KCanned502 = "HTTP/1.1 502 Bad Gateway\r\n"
-                                      "Content-Type: text/plain\r\n"
-                                      "Content-Length: 12\r\n"
-                                      "Connection: close\r\n"
-                                      "\r\n"
-                                      "Bad Gateway\n";
+namespace {
 
-/*
- *
- * ❯ oha -n 2000 -c 50 -t 2s --no-tui --disable-keepalive
-http://api.example.com:9000 Summary: Success rate: 100.00% Total: 142.5270 ms
-  Slowest:      8.6609 ms
-  Fastest:      2.1810 ms
-  Average:      3.4810 ms
-  Requests/sec: 14032.4289
+struct Config {
+  unsigned short port = 9000;
+  std::string host = "api.example.com"; // only Host value we accept
+  tcp::endpoint upstream{boost::asio::ip::make_address("127.0.0.1"), 3000};
+  unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+};
 
-  Total data:   33.20 KiB
-  Size/request: 17 B
-  Size/sec:     232.96 KiB
+Config cfg; // set once in main() before any thread starts
 
-Response time histogram:
-  2.181 ms [1]    |
-  2.829 ms [84]   |■
-  3.477 ms [1696] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  4.125 ms [19]   |
-  4.773 ms [1]    |
-  5.421 ms [7]    |
-  6.069 ms [16]   |
-  6.717 ms [18]   |
-  7.365 ms [22]   |
-  8.013 ms [23]   |
-  8.661 ms [113]  |■■
+const std::string kCanned502 = "HTTP/1.1 502 Bad Gateway\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "Content-Length: 12\r\n"
+                               "Connection: close\r\n"
+                               "\r\n"
+                               "Bad Gateway\n";
 
-Response time distribution:
-  10.00% in 2.8831 ms
-  25.00% in 2.9395 ms
-  50.00% in 3.0109 ms
-  75.00% in 3.1242 ms
-  90.00% in 4.7391 ms
-  95.00% in 8.2186 ms
-  99.00% in 8.5618 ms
-  99.90% in 8.6370 ms
-  99.99% in 8.6609 ms
+http::response<http::string_body> make_error(http::status s) {
+  http::response<http::string_body> r{s, 11};
+  r.set(http::field::content_type, "text/plain");
+  r.body() = std::string(http::obsolete_reason(s)) + "\n";
+  r.keep_alive(false);
+  r.prepare_payload();
+  return r;
+}
 
-
-Details (average, fastest, slowest):
-  DNS+dialup:   0.9787 ms, 0.5045 ms, 2.9080 ms
-  DNS-lookup:   0.0037 ms, 0.0007 ms, 0.5117 ms
-
-Status code distribution:
-  [200] 2000 responses
- *
- *
- *
- *
- *
- *
- *
- *
- *
- * */
-
-// boost::asio::awaitable<void> read_message(tcp::socket &sock, std::string
-// &buf) {
-//   boost::system::error_code ec;
-//   while (true) {
-//     auto header_end = buf.find("\r\n\r\n");
-//     if(header_end != std::string::npos){
-//       std::size_t header_len = header_end + 4;
-//     }
-//     std::size_t n = co_await sock.async_read_some(
-//         boost::asio::buffer(buf),
-//         boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-//   }
-// }
-
-boost::asio::awaitable<void> handle_session(tcp::socket sock) {
-  tcp::socket client(std::move(sock));
+boost::asio::awaitable<void> handle_session(tcp::socket client) {
   tcp::socket upstream(client.get_executor());
   bool upstream_alive = false;
+
+  boost::system::error_code ec;
+  client.set_option(tcp::no_delay(true), ec); // not inherited from acceptor
+
+  beast::flat_buffer client_buf; // per connection: keeps pipelined bytes
+  beast::flat_buffer upstream_buf;
+
+  auto token = boost::asio::redirect_error(boost::asio::use_awaitable, ec);
+
   try {
     for (;;) {
-
-      boost::system::error_code ec;
-      beast::flat_buffer client_buf;
-      beast::http::request<beast::http::string_body> req;
-
-      co_await beast::http::async_read(
-          client, client_buf, req,
-          boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-
-      if (ec) {
-        if (ec == beast::http::error::end_of_stream ||
-            ec == boost::asio::error::eof)
-          co_return;
-        throw beast::system_error(ec);
-      }
-
-      std::string host = req[beast::http::field::host];
-      if (host.empty()) {
+      // ---------- request ----------
+      http::request_parser<http::string_body> req_p; // 1 MB body limit
+      co_await http::async_read(client, client_buf, req_p, token);
+      if (ec == http::error::body_limit) {
+        auto err = make_error(http::status::payload_too_large);
+        co_await http::async_write(client, err, token);
         co_return;
       }
+      if (ec)
+        co_return; // client closed or sent garbage
+      auto &req = req_p.get();
+
+      std::string host = req[http::field::host];
       if (auto p = host.find(':'); p != std::string::npos)
         host = host.substr(0, p);
-
-      if (host != "api.example.com") {
+      if (host != cfg.host) {
+        auto err = make_error(host.empty() ? http::status::bad_request
+                                           : http::status::misdirected_request);
+        co_await http::async_write(client, err, token);
         co_return;
       }
+
+      bool client_ka = req.keep_alive(); // capture BEFORE rewriting headers
+      bool is_head = req.method() == http::verb::head;
+      req.erase(http::field::proxy_connection);
+      req.keep_alive(true); // upstream conn is ours, keep it
+
+      // ---------- upstream ----------
       if (!upstream_alive) {
-        co_await upstream.async_connect(
-            tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 3000),
-            boost::asio::use_awaitable);
+        co_await upstream.async_connect(cfg.upstream,
+                                        boost::asio::use_awaitable); // -> 502
+        upstream.set_option(tcp::no_delay(true), ec);
         upstream_alive = true;
       }
 
-      co_await beast::http::async_write(upstream, req,
-                                        boost::asio::use_awaitable);
+      co_await http::async_write(upstream, req, token);
+      if (ec)
+        throw beast::system_error(ec); // -> 502
 
-      beast::http::response<beast::http::string_body> res;
-      beast::flat_buffer upstream_buf;
-      co_await beast::http::async_read(
-          upstream, upstream_buf, res,
-          boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+      http::response_parser<http::string_body> res_p;
+      res_p.skip(is_head); // HEAD: Content-Length, no body
+      co_await http::async_read(upstream, upstream_buf, res_p, token);
+      if (ec)
+        throw beast::system_error(ec); // stale/dead upstream -> 502
+      auto &res = res_p.get();
 
-      if (ec) {
-        if (ec == beast::http::error::end_of_stream ||
-            ec == boost::asio::error::eof)
-          co_return;
-        throw beast::system_error(ec);
-      }
-      bool close = !req.keep_alive() || !res.keep_alive();
-      if (close) {
-        res.keep_alive(false);
-      }
+      // ---------- response ----------
+      bool upstream_ka = res.keep_alive();
+      bool client_close = !client_ka || res_p.need_eof(); // EOF-delimited body
+      res.keep_alive(!client_close);
 
-      co_await beast::http::async_write(client, res,
-                                        boost::asio::use_awaitable);
-      if (close) {
+      co_await http::async_write(client, res, token);
+      if (ec)
+        co_return; // client gone
+
+      if (!upstream_ka) { // upstream closing != client closing
+        upstream.close(ec);
         upstream_alive = false;
-        break;
       }
+      if (client_close)
+        break;
     }
-    boost::system::error_code ec;
     client.shutdown(tcp::socket::shutdown_send, ec);
 
-  } catch (const std::exception &e) {
-    std::cerr << "[session] FATAL: " << e.what() << std::endl;
+  } catch (const boost::system::system_error &e) {
+    // only upstream failures reach here, and nothing was sent to the client yet
+    std::cerr << "[session] upstream: " << e.code().message() << std::endl;
     boost::system::error_code ignore;
-    boost::asio::write(client, boost::asio::buffer(KCanned502), ignore);
+    boost::asio::write(client, boost::asio::buffer(kCanned502), ignore);
     client.shutdown(tcp::socket::shutdown_send, ignore);
   }
 }
-boost::asio::awaitable<void> listener(int listener_port) {
+
+boost::asio::awaitable<void> listener(tcp::acceptor &acceptor) {
   auto ex = co_await boost::asio::this_coro::executor;
-  tcp::acceptor acceptor_(ex);
+  boost::asio::steady_timer backoff(ex);
   boost::system::error_code ec;
+  auto token = boost::asio::redirect_error(boost::asio::use_awaitable, ec);
 
-  if (acceptor_.open(tcp::v4(), ec)) {
-    co_return;
-  }
-
-  if (acceptor_.set_option(tcp::acceptor::reuse_address(true), ec)) {
-    co_return;
-  }
-
-  if (acceptor_.bind(tcp::endpoint(tcp::v4(), listener_port), ec)) {
-    co_return;
-  }
-
-  if (acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec)) {
-    co_return;
-  }
-
-  while (true) {
-    tcp::socket sock = co_await acceptor_.async_accept();
+  for (;;) {
+    tcp::socket sock = co_await acceptor.async_accept(token);
+    if (ec) {
+      std::cerr << "[listener] accept: " << ec.message() << std::endl;
+      // Out of file descriptors: retrying immediately just spins. Give
+      // in-flight sessions a moment to close theirs.
+      if (ec == boost::asio::error::no_descriptors ||
+          ec == boost::system::errc::too_many_files_open_in_system) {
+        backoff.expires_after(std::chrono::milliseconds(100));
+        co_await backoff.async_wait(token);
+      }
+      continue;
+    }
     boost::asio::co_spawn(ex, handle_session(std::move(sock)),
                           boost::asio::detached);
   }
-
-  co_return;
 }
 
-int main() {
-  boost::asio::io_context io;
-  int listener_port = 9000;
-  boost::asio::co_spawn(io, listener(listener_port), boost::asio::detached);
-  std::vector<std::thread> pools;
-  pools.reserve(4);
-  for (unsigned i = 0; i < 4; i++) {
-    pools.emplace_back([&io] { io.run(); });
+void usage(const char *argv0) {
+  std::cerr << "usage: " << argv0
+            << " [--port N] [--upstream IP:PORT] [--host NAME] [--threads N]\n"
+               "defaults: --port 9000 --upstream 127.0.0.1:3000"
+               " --host api.example.com --threads <cpu count>\n";
+}
+
+bool parse_args(int argc, char **argv) {
+  try {
+    for (int i = 1; i < argc; ++i) {
+      std::string arg = argv[i];
+      if (arg == "-h" || arg == "--help") {
+        usage(argv[0]);
+        std::exit(0);
+      }
+      if (i + 1 >= argc)
+        return false;
+      std::string val = argv[++i];
+      if (arg == "--port") {
+        cfg.port = static_cast<unsigned short>(std::stoul(val));
+      } else if (arg == "--host") {
+        cfg.host = val;
+      } else if (arg == "--threads") {
+        cfg.threads = std::max(1u, static_cast<unsigned>(std::stoul(val)));
+      } else if (arg == "--upstream") {
+        auto colon = val.rfind(':');
+        if (colon == std::string::npos)
+          return false;
+        cfg.upstream = tcp::endpoint(
+            boost::asio::ip::make_address(val.substr(0, colon)),
+            static_cast<unsigned short>(std::stoul(val.substr(colon + 1))));
+      } else {
+        return false;
+      }
+    }
+  } catch (const std::exception &) { // bad number or IP address
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  if (!parse_args(argc, argv)) {
+    usage(argv[0]);
+    return 2;
   }
 
-  for (auto &t : pools) {
-    t.join();
+  boost::asio::io_context io;
+
+  boost::system::error_code ec;
+  tcp::acceptor acceptor(io);
+  acceptor.open(tcp::v4(), ec);
+  if (!ec)
+    acceptor.set_option(tcp::acceptor::reuse_address(true), ec);
+  if (!ec)
+    acceptor.bind(tcp::endpoint(tcp::v4(), cfg.port), ec);
+  if (!ec)
+    acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
+  if (ec) {
+    std::cerr << "cannot listen on port " << cfg.port << ": " << ec.message()
+              << std::endl;
+    return 1;
   }
+
+  std::cerr << "listening on :" << cfg.port << ", forwarding Host "
+            << cfg.host << " to " << cfg.upstream << " with " << cfg.threads
+            << " thread(s)" << std::endl;
+
+  boost::asio::co_spawn(io, listener(acceptor), boost::asio::detached);
+
+  std::vector<std::thread> pool;
+  for (unsigned i = 0; i < cfg.threads; ++i)
+    pool.emplace_back([&io] { io.run(); });
+  for (auto &t : pool)
+    t.join();
 
   return 0;
 }

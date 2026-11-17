@@ -1,4 +1,10 @@
-build/
-.ruff_cache/
-.DS_Store
+build*/
+out/
+prof/
+*.svg
+*.folded
+*.trace
 compile_commands.json
+.DS_Store
+.ruff_cache/
+__pycache__/
